@@ -1,1 +1,1 @@
-# Piece-wise Polynomial functions approximated using Regression Trees
+# Piece-wise Polynomial functions approximated using Optimal Regression Trees
