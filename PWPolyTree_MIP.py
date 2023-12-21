@@ -1,18 +1,21 @@
 import gurobipy as gb
 import numpy as np
 
+
 class PieceWisePolyTree_MIP:
-    def __init__(self, depth, data_handler, poly_order=1, min_in_leaf=1, use_mse=False):
+    def __init__(self, depth, data_handler, poly_order=1, min_in_leaf=1, use_mse=False, axis_aligned=True, mu=0.0001):
         self.depth = depth
         self.data_h = data_handler
         self.min_in_leaf = min_in_leaf
         self.poly_order = poly_order
         self.use_mse = use_mse
+        self.axis_aligned = axis_aligned
         self.n_polycombs = self.get_exponents(self.data_h.n_features).shape[1]
 
         self.__n_leaf_nodes = 2**self.depth
         self.__n_branch_nodes = 2**self.depth - 1
         self.model = None
+        self.mu = mu
 
     def get_exponents(self, dim):
         if self.poly_order == 0:
@@ -66,9 +69,31 @@ class PieceWisePolyTree_MIP:
         self.model = gb.Model("PWPolyTree model")
 
         # branch nodes computation conditions
-        a = self.model.addMVar((self.data_h.n_features, self.__n_branch_nodes), vtype=gb.GRB.BINARY, name="a")
-        b = self.model.addMVar((self.__n_branch_nodes,), lb=0, ub=1, vtype=gb.GRB.CONTINUOUS, name="b")
-        self.model.addConstr(a.sum(axis=0) == 1)
+        if self.axis_aligned:
+            a = self.model.addMVar((self.data_h.n_features, self.__n_branch_nodes), vtype=gb.GRB.BINARY, name="a")
+            self.model.addConstr(a.sum(axis=0) == 1)
+        else:
+            a = self.model.addMVar((self.data_h.n_features, self.__n_branch_nodes), vtype=gb.GRB.CONTINUOUS, lb=-1, ub=1, name="a")
+
+            apos = self.model.addMVar((self.data_h.n_features, self.__n_branch_nodes), vtype=gb.GRB.CONTINUOUS, ub=1, name="apos")
+            aneg = self.model.addMVar((self.data_h.n_features, self.__n_branch_nodes), vtype=gb.GRB.CONTINUOUS, ub=1, name="aneg")
+            adec = self.model.addMVar((self.data_h.n_features, self.__n_branch_nodes), vtype=gb.GRB.BINARY, name="adec")
+            self.model.addConstr(apos <= adec)
+            self.model.addConstr(aneg <= (1 - adec))
+            self.model.addConstr(apos.sum(axis=0) + aneg.sum(axis=0) == 1)
+            self.model.addConstr(a == apos-aneg)
+
+            # bertsimas variant
+            # aabs = self.model.addMVar((self.data_h.n_features, self.__n_branch_nodes), vtype=gb.GRB.CONTINUOUS, ub=1, name="aabs")
+            # self.model.addConstr(a <= aabs)
+            # self.model.addConstr(-a <= aabs)
+            # self.model.addConstr(aabs.sum(axis=0) == 1)
+
+
+        if self.axis_aligned:
+            b = self.model.addMVar((self.__n_branch_nodes,), lb=0, ub=1, vtype=gb.GRB.CONTINUOUS, name="b")
+        else:
+            b = self.model.addMVar((self.__n_branch_nodes,), lb=-1, ub=1, vtype=gb.GRB.CONTINUOUS, name="b")
 
         # leaf nodes assignment conditions
         point_assigned = self.model.addMVar((self.data_h.n_data, self.__n_leaf_nodes), vtype=gb.GRB.BINARY, name="point_assigned") # variable z
@@ -80,14 +105,23 @@ class PieceWisePolyTree_MIP:
         self.model.addConstr(point_assigned.sum(axis=1) == 1)
 
         # big-M constants
-        M_right = 1
-        M_left = 1 + self.data_h.epsilons.max()
+        if self.axis_aligned:
+            M_right = 1
+            M_left = 1 + self.data_h.epsilons.max()
+        else:
+            M_right = 2
+            M_left = 2 + self.mu
         # conditions for assignment to node
         for leaf_i in range(self.__n_leaf_nodes):
             if right_ancestors[leaf_i]: # causes issues if there are no ancestors
                 self.model.addConstr(X @ a[:, right_ancestors[leaf_i]] >= b[np.newaxis, right_ancestors[leaf_i]] - M_right*(1-point_assigned[:,[leaf_i]]))
             if left_ancestors[leaf_i]:
-                self.model.addConstr((X + self.data_h.epsilons) @ a[:, left_ancestors[leaf_i]] <= b[np.newaxis, left_ancestors[leaf_i]] + M_left*(1-point_assigned[:,[leaf_i]]))
+                if self.axis_aligned:
+                    self.model.addConstr((X + self.data_h.epsilons) @ a[:, left_ancestors[leaf_i]] <= b[np.newaxis, left_ancestors[leaf_i]] + M_left*(1-point_assigned[:,[leaf_i]]))
+                else:
+                    # ~bertsimas variant
+                    # self.model.addConstr(X @ a[:, left_ancestors[leaf_i]] + self.data_h.epsilons @ aabs[:, left_ancestors[leaf_i]] <= b[np.newaxis, left_ancestors[leaf_i]] + M_left*(1-point_assigned[:,[leaf_i]]))
+                    self.model.addConstr(X @ a[:, left_ancestors[leaf_i]] + self.mu <= b[np.newaxis, left_ancestors[leaf_i]] + M_left*(1-point_assigned[:,[leaf_i]]))
 
         # regression
         X_polycombs = self.__get_polycombinations(X)
@@ -116,6 +150,8 @@ class PieceWisePolyTree_MIP:
 
         self.vars = {
             "a": a,
+            # "apos": apos,
+            # "aneg": aneg,
             "b": b,
             "point_assigned": point_assigned,
             "any_assigned": any_assigned,
@@ -175,6 +211,7 @@ class PieceWisePolyTree_MIP:
             "poly_order": self.poly_order,
             "data_h_setup": self.data_h.get_setup(),
             "use_mse": self.use_mse,
+            "axis_aligned": self.axis_aligned,
             "n_polycombs": self.n_polycombs,
             "n_data": self.data_h.n_data,
             "n_features": self.data_h.n_features,
