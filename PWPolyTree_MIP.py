@@ -17,10 +17,23 @@ class PieceWisePolyTree_MIP:
     def get_exponents(self, dim):
         if self.poly_order == 0:
             return np.zeros((dim, 0))
-        if self.poly_order == 1:
-            return np.eye(dim)
         else:
-            raise Exception("invalid argument, higher orders not yet implemented")
+            prev = np.eye(dim)
+            res = [prev]
+            for _ in range(1, self.poly_order):
+                aggregate = []
+                for col_i in range(prev.shape[1]):
+                    col = prev[:,col_i:col_i+1]
+                    last_nonzero = np.argwhere(col > 0).max()
+                    # if last_nonzero != 0:
+                        # print(np.zeros((last_nonzero,dim-last_nonzero)), np.eye(dim - last_nonzero))
+                    aggregate.append(col + np.concatenate([np.zeros((last_nonzero,dim-last_nonzero)), np.eye(dim - last_nonzero)]))
+                    # else:
+                        # aggregate.append(col + np.eye(dim - last_nonzero))
+                prev = np.concatenate(aggregate, axis=1)
+                res.append(prev)
+        return np.concatenate(res, axis=1)
+            # raise Exception("invalid argument, higher orders not yet implemented")
 
     def __get_polycombinations(self, X):
         expo = self.get_exponents(self.data_h.n_features)
