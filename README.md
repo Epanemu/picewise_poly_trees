@@ -1,7 +1,7 @@
 # Piece-wise Polynomial functions approximated using Optimal Regression Trees
 
-The implementation will be/is a part of a couple of papers:
+The implementation will is a part of a paper:
 
 Piecewise Polynomial Regression of Tame Functions via Integer Programming \
-*__Jiří Němeček__, Gilles Bareilles, Johannes Aspman, Jakub Mareček* \
+*Gilles Bareilles, Johannes Aspman, __Jiří Němeček__, Jakub Mareček* \
 [link to the preprint](https://nemecekjiri.cz/files/tame_piecewisepoly.pdf)
