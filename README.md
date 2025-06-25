@@ -1,5 +1,17 @@
 # Piece-wise Polynomial functions approximated using Optimal Regression Trees
 
+This repository contains the implementation of a general polynomial regression using trees. It can handle any number of dimensions, any order of the polynomial and it can split without axis alignment. It uses Mixed-integer Optimization to find the globaly optimal approximations.
+
+![The approximation an infinity norm](figs/norminf.png)
+
+We can also approximate general neural networks, for example.
+![The approximation of a Neural Net](figs/NN_depths.png)
+
+The only downside is the time complexity, though we show that we are able to find high quality solutions in little time, compared to the entire run of the solver.
+
+![The solving process](figs/mip_process.png)
+Almost optimal solution is found in seconds, while the dual bound takes 50 minutes to meet the primal obund and prove optimality.
+
 This is a repository containing the implementation and replication information for an article
 
 Piecewise Polynomial Regression of Tame Functions via Integer Programming \
@@ -8,7 +20,7 @@ _Gilles Bareilles, Johannes Aspman, **Jiří Němeček**, Jakub Mareček_ \
 
 ## Source code
 
-All source files are in the `src` directory. Most notable is the `PWPolyTree_MIP.py` file, containing the implementation of the axis-aligned and affine-hyperplane MIP formulations.
+The key source file is the `PWPolyTree_MIP.py`, containing the implementation of the axis-aligned and affine-hyperplane MIP formulations.
 `noise_sample_data.py` is a generator for the denoising scenarios. It is a direct reimplementation of the original work introducing the scenarios.
 
 The code used to stratify the Neural Network outputs is not attached since it is well described in the appendix and is not as relevant to the topic of the work.
