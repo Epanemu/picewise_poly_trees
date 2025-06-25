@@ -1,9 +1,23 @@
+from typing import Callable, Optional
+
 import gurobipy as gb
 import numpy as np
 
+from DataHandler import DataHandler
+
 
 class PieceWisePolyTree_MIP:
-    def __init__(self, depth, data_handler, poly_order=1, min_in_leaf=1, use_mse=False, axis_aligned=True, mu=0.0001):
+    def __init__(
+        self,
+        depth: int,  # D
+        data_handler: DataHandler,
+        poly_order: int = 1,  # n
+        min_in_leaf: int = 1,  # N_min
+        use_mse: bool = False,
+        axis_aligned: bool = True,
+        alpha: float = 0,  # optional coefficient for limiting complexity of the tree itself
+        mu: float = 0.0001,  # mu
+    ):
         self.depth = depth
         self.data_h = data_handler
         self.min_in_leaf = min_in_leaf
@@ -14,10 +28,13 @@ class PieceWisePolyTree_MIP:
 
         self.__n_leaf_nodes = 2**self.depth
         self.__n_branch_nodes = 2**self.depth - 1
-        self.model = None
+        self.model: Optional[gb.Model] = None
         self.mu = mu
+        self.alpha = alpha
+        self.optimize_structure = alpha != 0
 
-    def get_exponents(self, dim):
+    def get_exponents(self, dim: int) -> np.ndarray:
+        """returns a matrix needed to compute the polynomial combinations of input of dimension dim"""
         if self.poly_order == 0:
             return np.zeros((dim, 0))
         else:
@@ -26,32 +43,36 @@ class PieceWisePolyTree_MIP:
             for _ in range(1, self.poly_order):
                 aggregate = []
                 for col_i in range(prev.shape[1]):
-                    col = prev[:,col_i:col_i+1]
+                    col = prev[:, col_i : col_i + 1]
                     last_nonzero = np.argwhere(col > 0).max()
-                    # if last_nonzero != 0:
-                        # print(np.zeros((last_nonzero,dim-last_nonzero)), np.eye(dim - last_nonzero))
-                    aggregate.append(col + np.concatenate([np.zeros((last_nonzero,dim-last_nonzero)), np.eye(dim - last_nonzero)]))
-                    # else:
-                        # aggregate.append(col + np.eye(dim - last_nonzero))
+                    aggregate.append(
+                        col
+                        + np.concatenate(
+                            [
+                                np.zeros((last_nonzero, dim - last_nonzero)),
+                                np.eye(dim - last_nonzero),
+                            ]
+                        )
+                    )
                 prev = np.concatenate(aggregate, axis=1)
                 res.append(prev)
         return np.concatenate(res, axis=1)
-            # raise Exception("invalid argument, higher orders not yet implemented")
 
-    def __get_polycombinations(self, X):
+    def __get_polycombinations(self, X: np.ndarray) -> np.ndarray:
         expo = self.get_exponents(self.data_h.n_features)
         return X @ expo
 
-    def make_model(self, X, y):
-        left_ancestors = [] # those where decision went left
-        right_ancestors = [] # those where decision went right
+    def make_model(self, X: np.ndarray, y: np.ndarray):
+        """Sets up the model."""
+        left_ancestors: list[list[int]] = []  # those where decision went left
+        right_ancestors: list[list[int]] = []  # those where decision went right
         for leaf_i in range(self.__n_leaf_nodes):
             left_ancestors.append([])
             right_ancestors.append([])
             prev_i = leaf_i + self.__n_branch_nodes
             for _ in range(self.depth):
-                parent_i = (prev_i-1) // 2
-                if (prev_i-1) % 2:
+                parent_i = (prev_i - 1) // 2
+                if (prev_i - 1) % 2:
                     right_ancestors[leaf_i].append(parent_i)
                 else:
                     left_ancestors[leaf_i].append(parent_i)
@@ -68,39 +89,81 @@ class PieceWisePolyTree_MIP:
         # MAKE THE MILP MODEL
         self.model = gb.Model("PWPolyTree model")
 
+        d_limit = 1
+        if self.optimize_structure:
+            d = self.model.addMVar(
+                (self.__n_branch_nodes,), vtype=gb.GRB.BINARY, name="d"
+            )
+            for i in range(1, self.__n_branch_nodes):
+                self.model.addConstr(d[i] <= d[(i - 1) // 2])
+            d_limit = d
+
         # branch nodes computation conditions
         if self.axis_aligned:
-            a = self.model.addMVar((self.data_h.n_features, self.__n_branch_nodes), vtype=gb.GRB.BINARY, name="a")
-            self.model.addConstr(a.sum(axis=0) == 1)
+            a = self.model.addMVar(
+                (self.data_h.n_features, self.__n_branch_nodes),
+                vtype=gb.GRB.BINARY,
+                name="a",
+            )
+            self.model.addConstr(a.sum(axis=0) == d_limit)
         else:
-            a = self.model.addMVar((self.data_h.n_features, self.__n_branch_nodes), vtype=gb.GRB.CONTINUOUS, lb=-1, ub=1, name="a")
+            a = self.model.addMVar(
+                (self.data_h.n_features, self.__n_branch_nodes),
+                vtype=gb.GRB.CONTINUOUS,
+                lb=-1,
+                ub=1,
+                name="a",
+            )
 
-            apos = self.model.addMVar((self.data_h.n_features, self.__n_branch_nodes), vtype=gb.GRB.CONTINUOUS, ub=1, name="apos")
-            aneg = self.model.addMVar((self.data_h.n_features, self.__n_branch_nodes), vtype=gb.GRB.CONTINUOUS, ub=1, name="aneg")
-            adec = self.model.addMVar((self.data_h.n_features, self.__n_branch_nodes), vtype=gb.GRB.BINARY, name="adec")
+            apos = self.model.addMVar(
+                (self.data_h.n_features, self.__n_branch_nodes),
+                vtype=gb.GRB.CONTINUOUS,
+                ub=1,
+                name="apos",
+            )  # a+
+            aneg = self.model.addMVar(
+                (self.data_h.n_features, self.__n_branch_nodes),
+                vtype=gb.GRB.CONTINUOUS,
+                ub=1,
+                name="aneg",
+            )  # a-
+            adec = self.model.addMVar(
+                (self.data_h.n_features, self.__n_branch_nodes),
+                vtype=gb.GRB.BINARY,
+                name="adec",
+            )  # o
             self.model.addConstr(apos <= adec)
             self.model.addConstr(aneg <= (1 - adec))
-            self.model.addConstr(apos.sum(axis=0) + aneg.sum(axis=0) == 1)
-            self.model.addConstr(a == apos-aneg)
-
-            # bertsimas variant
-            # aabs = self.model.addMVar((self.data_h.n_features, self.__n_branch_nodes), vtype=gb.GRB.CONTINUOUS, ub=1, name="aabs")
-            # self.model.addConstr(a <= aabs)
-            # self.model.addConstr(-a <= aabs)
-            # self.model.addConstr(aabs.sum(axis=0) == 1)
-
+            self.model.addConstr(apos.sum(axis=0) + aneg.sum(axis=0) == d_limit)
+            self.model.addConstr(a == apos - aneg)
 
         if self.axis_aligned:
-            b = self.model.addMVar((self.__n_branch_nodes,), lb=0, ub=1, vtype=gb.GRB.CONTINUOUS, name="b")
+            b = self.model.addMVar(
+                (self.__n_branch_nodes,), lb=0, ub=1, vtype=gb.GRB.CONTINUOUS, name="b"
+            )
         else:
-            b = self.model.addMVar((self.__n_branch_nodes,), lb=-1, ub=1, vtype=gb.GRB.CONTINUOUS, name="b")
+            b = self.model.addMVar(
+                (self.__n_branch_nodes,), lb=-1, ub=1, vtype=gb.GRB.CONTINUOUS, name="b"
+            )
+        if self.optimize_structure:
+            self.model.addConstr(b <= d)
+            if not self.axis_aligned:
+                self.model.addConstr(b >= -d)
 
         # leaf nodes assignment conditions
-        point_assigned = self.model.addMVar((self.data_h.n_data, self.__n_leaf_nodes), vtype=gb.GRB.BINARY, name="point_assigned") # variable z
-        any_assigned = self.model.addMVar((self.__n_leaf_nodes,), vtype=gb.GRB.BINARY, name="any_assigned") # variable l
+        point_assigned = self.model.addMVar(
+            (self.data_h.n_data, self.__n_leaf_nodes),
+            vtype=gb.GRB.BINARY,
+            name="point_assigned",
+        )  # variable z
+        any_assigned = self.model.addMVar(
+            (self.__n_leaf_nodes,), vtype=gb.GRB.BINARY, name="any_assigned"
+        )  # variable l
         self.model.addConstr(point_assigned <= any_assigned)
         # if any point is assigned, the node must be assigned at least self.min_in_leaf in total
-        self.model.addConstr(point_assigned.sum(axis=0) >= any_assigned * self.min_in_leaf)
+        self.model.addConstr(
+            point_assigned.sum(axis=0) >= any_assigned * self.min_in_leaf
+        )
         # points assigned to exactly one leaf
         self.model.addConstr(point_assigned.sum(axis=1) == 1)
 
@@ -113,45 +176,94 @@ class PieceWisePolyTree_MIP:
             M_left = 2 + self.mu
         # conditions for assignment to node
         for leaf_i in range(self.__n_leaf_nodes):
-            if right_ancestors[leaf_i]: # causes issues if there are no ancestors
-                self.model.addConstr(X @ a[:, right_ancestors[leaf_i]] >= b[np.newaxis, right_ancestors[leaf_i]] - M_right*(1-point_assigned[:,[leaf_i]]))
+            if right_ancestors[leaf_i]:  # causes issues if there are no ancestors
+                self.model.addConstr(
+                    X @ a[:, right_ancestors[leaf_i]]
+                    >= b[np.newaxis, right_ancestors[leaf_i]]
+                    - M_right * (1 - point_assigned[:, [leaf_i]])
+                )
             if left_ancestors[leaf_i]:
                 if self.axis_aligned:
-                    self.model.addConstr((X + self.data_h.epsilons) @ a[:, left_ancestors[leaf_i]] <= b[np.newaxis, left_ancestors[leaf_i]] + M_left*(1-point_assigned[:,[leaf_i]]))
+                    if self.optimize_structure:
+                        mineps = self.data_h.epsilons.min()
+                        self.model.addConstr(
+                            (X + self.data_h.epsilons - mineps)
+                            @ a[:, left_ancestors[leaf_i]]
+                            + mineps
+                            <= b[np.newaxis, left_ancestors[leaf_i]]
+                            + M_left * (1 - point_assigned[:, [leaf_i]])
+                        )
+                    else:
+                        self.model.addConstr(
+                            (X + self.data_h.epsilons) @ a[:, left_ancestors[leaf_i]]
+                            <= b[np.newaxis, left_ancestors[leaf_i]]
+                            + M_left * (1 - point_assigned[:, [leaf_i]])
+                        )
                 else:
-                    # ~bertsimas variant
-                    # self.model.addConstr(X @ a[:, left_ancestors[leaf_i]] + self.data_h.epsilons @ aabs[:, left_ancestors[leaf_i]] <= b[np.newaxis, left_ancestors[leaf_i]] + M_left*(1-point_assigned[:,[leaf_i]]))
-                    self.model.addConstr(X @ a[:, left_ancestors[leaf_i]] + self.mu <= b[np.newaxis, left_ancestors[leaf_i]] + M_left*(1-point_assigned[:,[leaf_i]]))
+                    self.model.addConstr(
+                        X @ a[:, left_ancestors[leaf_i]] + self.mu
+                        <= b[np.newaxis, left_ancestors[leaf_i]]
+                        + M_left * (1 - point_assigned[:, [leaf_i]])
+                    )
 
         # regression
         X_polycombs = self.__get_polycombinations(X)
-        poly_coeffs = self.model.addMVar((self.n_polycombs, self.__n_leaf_nodes), lb=float('-inf'), vtype=gb.GRB.CONTINUOUS, name="poly_coeffs") # vectors c_t (together with intercept)
-        intercepts = self.model.addMVar((self.__n_leaf_nodes,), lb=float('-inf'), vtype=gb.GRB.CONTINUOUS, name="intercepts")
-        point_error = self.model.addMVar((self.data_h.n_data, self.__n_leaf_nodes), lb=float('-inf'), vtype=gb.GRB.CONTINUOUS, name="point_error") # variable phi
+        poly_coeffs = self.model.addMVar(
+            (self.n_polycombs, self.__n_leaf_nodes),
+            lb=float("-inf"),
+            vtype=gb.GRB.CONTINUOUS,
+            name="poly_coeffs",
+        )  # vectors c_t
+        intercepts = self.model.addMVar(
+            (self.__n_leaf_nodes,),
+            lb=float("-inf"),
+            vtype=gb.GRB.CONTINUOUS,
+            name="intercepts",
+        )
+        point_error = self.model.addMVar(
+            (self.data_h.n_data, self.__n_leaf_nodes),
+            lb=float("-inf"),
+            vtype=gb.GRB.CONTINUOUS,
+            name="point_error",
+        )  # variable phi
 
-        self.model.addConstr(point_error == y - (X_polycombs @ poly_coeffs + intercepts))
+        self.model.addConstr(
+            point_error == y - (X_polycombs @ poly_coeffs + intercepts)
+        )
 
-        abs_error = self.model.addMVar((self.data_h.n_data,), vtype=gb.GRB.CONTINUOUS, name="abs_error") # variable delta
+        abs_error = self.model.addMVar(
+            (self.data_h.n_data,), vtype=gb.GRB.CONTINUOUS, name="abs_error"
+        )  # variable delta
 
-        self.model.addConstrs((point_assigned[i, t].item() == 1) >> (abs_error[i].item() >= point_error[i, t].item())
-                                    for i in range(self.data_h.n_data) for t in range(self.__n_leaf_nodes))
-        self.model.addConstrs((point_assigned[i, t].item() == 1) >> (abs_error[i].item() >= -point_error[i, t].item())
-                                    for i in range(self.data_h.n_data) for t in range(self.__n_leaf_nodes))
+        self.model.addConstrs(
+            (point_assigned[i, t].item() == 1)
+            >> (abs_error[i].item() >= point_error[i, t].item())
+            for i in range(self.data_h.n_data)
+            for t in range(self.__n_leaf_nodes)
+        )
+        self.model.addConstrs(
+            (point_assigned[i, t].item() == 1)
+            >> (abs_error[i].item() >= -point_error[i, t].item())
+            for i in range(self.data_h.n_data)
+            for t in range(self.__n_leaf_nodes)
+        )
 
+        secondary_terms = 0
+        if self.optimize_structure:
+            secondary_terms = self.alpha * d.sum()
         if self.use_mse:
-            self.model.setObjective((abs_error**2).sum() / self.data_h.n_data, sense=gb.GRB.MINIMIZE) # MSE objective
+            self.model.setObjective(
+                (abs_error**2).sum() / self.data_h.n_data + secondary_terms,
+                sense=gb.GRB.MINIMIZE,
+            )  # MSE objective
         else:
-            self.model.setObjective(abs_error.sum() / self.data_h.n_data, sense=gb.GRB.MINIMIZE) # MAE objective
-
-        # MAYBE LIMIT VALUES OF UNUSED COEFFS?
-        # self.model.addConstrs((any_assigned[t].item() == 0) >> (poly_coeffs[j, t].item() == 0)
-        #                             for j in range(self.n_polycombs) for t in range(self.__n_leaf_nodes))
-        # self.model.addConstrs((any_assigned[t].item() == 0) >> (intercepts[t].item() == 0) for t in range(self.__n_leaf_nodes))
+            self.model.setObjective(
+                abs_error.sum() / self.data_h.n_data + secondary_terms,
+                sense=gb.GRB.MINIMIZE,
+            )  # MAE objective
 
         self.vars = {
             "a": a,
-            # "apos": apos,
-            # "aneg": aneg,
             "b": b,
             "point_assigned": point_assigned,
             "any_assigned": any_assigned,
@@ -162,10 +274,21 @@ class PieceWisePolyTree_MIP:
         }
 
         self.model.update()
+        self.model.setParam("Seed", 0)
 
-
-    def optimize(self, time_limit=3600, mem_limit=None, n_threads=None, mip_focus=0, mip_heuristics=0.05, verbose=False, log_file=""):
-        assert self.model is not None
+    def optimize(
+        self,
+        time_limit: int = 3600,
+        mem_limit: Optional[int] = None,
+        n_threads: Optional[int] = None,
+        mip_focus: int = 0,  # default gurobi
+        mip_heuristics: float = 0.05,  # default gurobi
+        verbose: bool = False,
+        log_file: str = "",
+        callback: Optional[Callable] = None,
+    ) -> bool:
+        if self.model is None:
+            raise ValueError("model needs to be set up")
 
         if verbose:
             self.model.update()
@@ -187,9 +310,12 @@ class PieceWisePolyTree_MIP:
         if n_threads is not None:
             self.model.params.Threads = n_threads
 
-        self.model.optimize()
+        if callback is not None:
+            self.model.optimize(callback=callback)
+        else:
+            self.model.optimize()
 
-        return self.model.SolCount > 0 # return whether a solution was found
+        return self.model.SolCount > 0  # return whether a solution was found
 
     def get_humanlike_status(self):
         if self.model.Status == gb.GRB.OPTIMAL:
@@ -225,22 +351,49 @@ class PieceWisePolyTree_MIP:
             "status": self.get_humanlike_status(),
         }
 
-    def load_sol(self, sol_file):
+    def load_sol(self, sol_file: str):
         self.__dummy_model = gb.Model()
         self.__dummy_model.params.OutputFlag = 0
 
-        a = self.__dummy_model.addMVar((self.data_h.n_features, self.__n_branch_nodes), vtype=gb.GRB.BINARY, name="a")
-        b = self.__dummy_model.addMVar((self.__n_branch_nodes,), lb=0, ub=1, vtype=gb.GRB.CONTINUOUS, name="b")
-        point_assigned = self.__dummy_model.addMVar((self.data_h.n_data, self.__n_leaf_nodes), vtype=gb.GRB.BINARY, name="point_assigned") # variable z
-        any_assigned = self.__dummy_model.addMVar((self.__n_leaf_nodes,), vtype=gb.GRB.BINARY, name="any_assigned") # variable l
-        class_points_in_leaf = self.__dummy_model.addMVar((self.data_h.n_classes, self.__n_leaf_nodes), name="N_class_points_in_leaf") # variable N_kt
-        points_in_leaf = self.__dummy_model.addMVar((self.__n_leaf_nodes,), name="N_points_in_leaf") # variable N_t
+        a = self.__dummy_model.addMVar(
+            (self.data_h.n_features, self.__n_branch_nodes),
+            vtype=gb.GRB.BINARY,
+            name="a",
+        )
+        b = self.__dummy_model.addMVar(
+            (self.__n_branch_nodes,), lb=0, ub=1, vtype=gb.GRB.CONTINUOUS, name="b"
+        )
+        point_assigned = self.__dummy_model.addMVar(
+            (self.data_h.n_data, self.__n_leaf_nodes),
+            vtype=gb.GRB.BINARY,
+            name="point_assigned",
+        )  # variable z
+        any_assigned = self.__dummy_model.addMVar(
+            (self.__n_leaf_nodes,), vtype=gb.GRB.BINARY, name="any_assigned"
+        )  # variable l
 
-        poly_coeffs = self.__dummy_model.addMVar((self.n_polycombs, self.__n_leaf_nodes), lb=float('-inf'), vtype=gb.GRB.CONTINUOUS, name="poly_coeffs") # vectors c_t
-        intercepts = self.model.addMVar((self.__n_leaf_nodes,), lb=float('-inf'), vtype=gb.GRB.CONTINUOUS, name="intercepts")
-        point_error = self.__dummy_model.addMVar((self.data_h.n_data, self.__n_leaf_nodes), lb=float('-inf'), vtype=gb.GRB.CONTINUOUS, name="point_error") # variable phi
+        poly_coeffs = self.__dummy_model.addMVar(
+            (self.n_polycombs, self.__n_leaf_nodes),
+            lb=float("-inf"),
+            vtype=gb.GRB.CONTINUOUS,
+            name="poly_coeffs",
+        )  # vectors c_t
+        intercepts = self.__dummy_model.addMVar(
+            (self.__n_leaf_nodes,),
+            lb=float("-inf"),
+            vtype=gb.GRB.CONTINUOUS,
+            name="intercepts",
+        )
+        point_error = self.__dummy_model.addMVar(
+            (self.data_h.n_data, self.__n_leaf_nodes),
+            lb=float("-inf"),
+            vtype=gb.GRB.CONTINUOUS,
+            name="point_error",
+        )  # variable phi
 
-        abs_error = self.__dummy_model.addMVar((self.data_h.n_data,), vtype=gb.GRB.CONTINUOUS, name="abs_error") # variable delta
+        abs_error = self.__dummy_model.addMVar(
+            (self.data_h.n_data,), vtype=gb.GRB.CONTINUOUS, name="abs_error"
+        )  # variable delta
 
         self.vars = {
             "a": a,
@@ -257,4 +410,4 @@ class PieceWisePolyTree_MIP:
         self.__dummy_model.read(sol_file)
         self.__dummy_model.optimize()
 
-        self.model = None # should not optimize after this, need to rebuild the model
+        self.model = None  # should not optimize after this, need to rebuild the model
